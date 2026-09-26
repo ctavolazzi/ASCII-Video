@@ -61,3 +61,16 @@ pip install numpy pillow tqdm imageio imageio-ffmpeg
 <img src="Documentation/donuts.gif" alt="Donuts">
 
 <img src="Documentation/donuts-ascii.gif" alt="Donuts ASCII">
+
+# Seedhollow: an AI agent village
+
+`village.py` is a whole agent village in one file. Seven villagers and SEED-1, a farm robot, live through a day: they plan around hunger, energy and company, walk the map, farm, bake, fish, forge, chat, and pass a rumor from one to the next. Each frame is one village minute, rendered in pixel art and then through this repo's ASCII renderer.
+
+```
+python village.py                                  # 45 s day: village.mp4 + village_ascii.mp4
+python village.py --seconds 20 --no-ascii          # quick pixel-only render
+python village.py --shorts ../treasuretavern       # also cut a 1080x1920 Short with treasuretavern
+python village.py --llm                            # Claude writes the dialogue (anthropic package + API credentials)
+```
+
+Output goes to `village_out/`, including `village_log.json` with every event and each villager's memory. The same `--seed` always produces the same day.
