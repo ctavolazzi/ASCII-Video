@@ -1,3 +1,5 @@
 /.vscode
 
 *.mp4
+village_out/
+__pycache__/

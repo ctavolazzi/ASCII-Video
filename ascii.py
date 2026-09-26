@@ -36,7 +36,8 @@ def get_font_bitmaps(fontsize, boldness, reverse, background, chars, font):
     for char in chars:
         if char in bitmaps:
             continue
-        w, h = font_ttf.getsize(char)
+        # getsize() was removed in Pillow 10; the right/bottom of getbbox() match it.
+        _, _, w, h = font_ttf.getbbox(char)
         min_width, min_height = min(min_width, w), min(min_height, h)
         # Draw font character as a w x h image.
         image = Image.new('RGB', (w, h), (background,) * 3)
