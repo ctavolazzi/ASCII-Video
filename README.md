@@ -66,11 +66,11 @@ pip install numpy pillow tqdm imageio imageio-ffmpeg
 
 `village.py` is a whole agent village in one file. Seven villagers and SEED-1, a farm robot, live through the day. They plan around hunger, energy and company, walk the map, farm, bake, fish, forge, chat, and pass along a rumor. One frame is one village minute (`--speed` changes that).
 
-By default the agents are rule-based: a utility function picks each action and dialogue comes from templates. With `--llm`, Claude writes the conversations. Nothing in the story is scripted. The rumor is whatever remarkable thing happens first:
+By default the agents are rule-based: a utility function picks each action and dialogue comes from templates. With `--llm`, Claude rewrites the conversations after the simulation has run, concurrently, so rendering never waits on the network. Nothing in the story is scripted. The rumor is whatever remarkable thing happens first:
 - a pumpkin the robot kept watering after it ripened grows giant, or
 - Finn lands a golden carp.
 
-Across seeds 1 to 20, 18 produce a rumor within two days. Seed 3, the default, finds its rumor on day 1.
+Across seeds 1 to 50, 46 produce a rumor within two days (31 pumpkins, 15 carp). Seed 3, the default, finds its rumor on day 1.
 
 ```
 python village.py                                  # 45 s day: village.mp4, village_ascii.mp4, village_vertical.mp4
@@ -86,4 +86,22 @@ Outputs go to `village_out/`:
 - `village_vertical.mp4`: a 1080x1920 layout for Shorts, with the pixel view, the ASCII view and a rumor tracker.
 - `village_log.json`: every event and each villager's memory.
 
-The same `--seed` always produces the same day. A 50 s render with every output takes about 50 s on 4 CPUs; most of that is encoding the vertical video.
+The same `--seed` always produces the same day.
+
+## How it runs
+
+1. **Simulate.** The whole village runs first and records one snapshot per video frame. Two village days take well under a second.
+2. **Write dialogue** (with `--llm` only). Every recorded chat can be rewritten by Claude in parallel. Rumor-telling chats go first, up to `--llm-max`.
+3. **Render.** Frames are split into chunks across `--jobs` processes. Each process draws its frames and encodes its own segment files.
+4. **Join.** Segments are concatenated without re-encoding.
+
+A 50 s render with every output takes about 21 s on 4 CPUs (`--jobs 4 --preset veryfast`), against 39 to 49 s in a single process. Encoding is most of the CPU time, which is why `--preset` matters as much as `--jobs`.
+
+`python -m unittest test_village` runs 23 tests in about 6 s. The behavioural tests sweep 50 seeds over two days and check invariants on every tick:
+- no one walks through walls
+- stock never goes negative
+- everyone is asleep at 01:30
+- nobody learns the rumor without being told or seeing it
+
+They also check the encoded files for frame counts and exact sizes.
+

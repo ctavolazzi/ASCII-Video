@@ -28,9 +28,14 @@ import sys
 import json
 import math
 import random
+import time
+import shutil
 import argparse
 import subprocess
+import multiprocessing
 from collections import deque
+from types import SimpleNamespace
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import imageio_ffmpeg
@@ -219,44 +224,44 @@ def parse_exchange(text, a_name, b_name):
 
 class ClaudeWriter:
     '''
-    Optional: asks Claude for a two-line exchange between villagers.
+    Optional: rewrites recorded chats with Claude after the simulation has run.
 
-    Returns None whenever it cannot help (package missing, no credentials, API error,
-    refusal, unparseable reply) and the sim falls back to its template lines. Missing
-    credentials disable it for the rest of the run instead of failing on every chat.
-    Anything else is a bug in this file and is allowed to raise.
+    The sim records every conversation with template lines. fill() asks Claude for
+    replacements concurrently, so the render never waits on the network. It returns
+    {(chat_id, 0 or 1): line}; any chat it cannot improve keeps its template lines.
+    Missing package or credentials disable it up front. API and network errors fall
+    back per chat. Anything else is a bug in this file and is allowed to raise.
     '''
 
-    def __init__(self, model, max_calls, client=None):
-        self.model, self.max_calls, self.calls = model, max_calls, 0
-        self.client = client
-        self.failures = 0
-        self.anthropic = None
+    def __init__(self, model, max_calls, client=None, workers=8):
+        self.model, self.max_calls, self.workers = model, max_calls, workers
+        self.calls = self.failures = 0
+        self.client = None  # set only once credentials are confirmed
+        self.errors = (ConnectionError,)
         if client is None:
             try:
                 import anthropic
             except ImportError:
                 print('[llm] disabled: pip install anthropic', file=sys.stderr)
                 return
-            self.anthropic = anthropic
-            self.client = anthropic.Anthropic()
+            self.errors = (anthropic.APIStatusError, anthropic.APIConnectionError)
+            client = anthropic.Anthropic()
+        if not (client.api_key or client.auth_token or client.credentials is not None):
+            print('[llm] disabled: no Claude API credentials found', file=sys.stderr)
+            return
+        self.client = client
 
-    def _errors(self):
-        if self.anthropic is None:
-            return (ConnectionError,)
-        return (self.anthropic.APIStatusError, self.anthropic.APIConnectionError)
-
-    def exchange(self, a, b, clock, rumor=None):
-        if not self.client or self.calls >= self.max_calls:
-            return None
-        self.calls += 1
-        news = f' {a.name} is excited to tell {b.name} this rumor: "{rumor}".' if rumor else ''
-        prompt = (
-            f'Village of Seedhollow, {clock}. {a.name} the {a.role} meets {b.name} the {b.role}.'
-            f' {a.name} last did: {a.memory[-1] if a.memory else "nothing yet"}.{news}'
-            f' Write their exchange as exactly two lines, "{a.name}: ..." then "{b.name}: ...".'
+    def prompt(self, chat):
+        a, b = chat['a'], chat['b']
+        news = f' {a} is excited to tell {b} this rumor: "{chat["rumor"]}".' if chat['rumor'] else ''
+        return (
+            f'Village of Seedhollow, day {chat["day"]}, {chat["time"]}. {a} the {chat["a_role"]} meets'
+            f' {b} the {chat["b_role"]}. {a} last did: {chat["a_last"] or "nothing yet"}.{news}'
+            f' Write their exchange as exactly two lines, "{a}: ..." then "{b}: ...".'
             ' Each line at most 9 words, plain words, no emoji. SEED-1 speaks in capitals.'
         )
+
+    def exchange(self, chat):
         try:
             resp = self.client.beta.messages.create(
                 model=self.model,
@@ -264,24 +269,43 @@ class ClaudeWriter:
                 output_config={'effort': 'low'},
                 betas=['server-side-fallback-2026-07-01'],
                 fallbacks='default',
-                messages=[{'role': 'user', 'content': prompt}],
+                messages=[{'role': 'user', 'content': self.prompt(chat)}],
             )
-        except TypeError as e:
-            # The SDK raises TypeError at request time when it finds no credentials.
-            # Any other TypeError (a bad argument, an SDK too old for `fallbacks`) is a real bug.
-            if 'authentication' not in str(e):
-                raise
-            print('[llm] disabled: no Claude API credentials found', file=sys.stderr)
-            self.client = None
-            return None
-        except self._errors() as e:
+        except self.errors as e:
             self.failures += 1
-            print(f'[llm] call failed, using template lines: {e}', file=sys.stderr)
+            print(f'[llm] chat {chat["id"]} kept its template lines: {e}', file=sys.stderr)
             return None
         if resp.stop_reason == 'refusal':
             return None
         text = ''.join(blk.text for blk in resp.content if blk.type == 'text')
-        return parse_exchange(text, a.name, b.name)
+        return parse_exchange(text, chat['a'], chat['b'])
+
+    def fill(self, chats):
+        if not self.client:
+            return {}
+        # rumor-telling chats matter most, then the rest in order
+        chosen = sorted(chats, key=lambda c: (c['rumor'] is None, c['id']))[:self.max_calls]
+        self.calls = len(chosen)
+        with ThreadPoolExecutor(max_workers=self.workers) as pool:
+            results = list(pool.map(self.exchange, chosen))
+        lines = {}
+        for chat, pair in zip(chosen, results):
+            if pair:
+                lines[(chat['id'], 0)], lines[(chat['id'], 1)] = pair
+        return lines
+
+
+def snapshot(v):
+    '''Everything the renderers need from one village minute, as plain picklable data.'''
+    return SimpleNamespace(
+        minute=v.minute, day=v.day, clock=v.clock, hour=v.hour, stock=dict(v.stock),
+        events=v.events[-3:], rumor=v.rumor,
+        plots=[SimpleNamespace(tx=p.tx, ty=p.ty, growth=p.growth, water=p.water) for p in v.plots],
+        agents=[SimpleNamespace(
+            name=a.name, role=a.role, home=a.home, color=a.color, skin=a.skin, is_robot=a.is_robot,
+            x=a.x, y=a.y, hidden=a.hidden, moving=a.moving, action=a.action, path=bool(a.path),
+            knows=a.knows, bubble=a.bubble) for a in v.agents],
+    )
 
 
 # ---------------------------------------------------------------- agents
@@ -305,7 +329,8 @@ class Agent:
         self.wake = rng.randint(5 * 60 + 35, 6 * 60 + 40)
         self.knows = False
         self.memory = []
-        self.bubble = None      # (text, frames_left)
+        self.bubble = None      # (text, frames_left, chat_ref or None)
+        self.pending_line = None  # (text, chat_ref) the partner says halfway through a chat
         self.chat = None        # (partner, frames_left)
         self.moving = False
         self.hidden = True
@@ -314,8 +339,8 @@ class Agent:
     def is_robot(self):
         return self.role == 'robot'
 
-    def say(self, text, frames=26):
-        self.bubble = (text, frames)
+    def say(self, text, frames=26, ref=None):
+        self.bubble = (text, frames, ref)
 
     def go(self, tile):
         self.goal = tile
@@ -340,7 +365,7 @@ class Agent:
 
 
 class Village:
-    def __init__(self, seed, start_minute, writer=None):
+    def __init__(self, seed, start_minute):
         self.rng = random.Random(seed)
         self.minute = start_minute   # minutes since midnight of day 1
         self.rumor = None            # (key, text) of the first remarkable event
@@ -350,7 +375,7 @@ class Village:
         self.stock = {'crops': 2, 'bread': 3, 'fish': 1, 'tools': 0, 'pages': 0}
         self.events = []
         self.pair_cd = {}
-        self.writer = writer
+        self.chats = []   # every conversation, so dialogue can be (re)written after the sim
         robot = self.by_name['SEED-1']
         robot.action, robot.hidden = 'idle', False
 
@@ -557,16 +582,20 @@ class Village:
             a, b = b, a
         tells = a.knows and not b.knows
         rumor = self.rumor[1] if tells else None
-        lines = self.writer.exchange(a, b, self.clock, rumor) if self.writer else None
-        if not lines:
-            if tells:
-                lines = (self.rng.choice(TELL).format(r=rumor), self.rng.choice(RUMORS[self.rumor[0]][1]))
-            elif self.rng.random() < 0.5:
-                lines = (self.rng.choice(GREET[time_of_day(self.hour)]).format(b=b.name), self.rng.choice(REPLY))
-            else:
-                lines = (self.rng.choice(TOPIC[a.role]), self.rng.choice(REPLY))
-        a.say(lines[0], 30)
-        b.pending_line = lines[1]
+        if tells:
+            lines = (self.rng.choice(TELL).format(r=rumor), self.rng.choice(RUMORS[self.rumor[0]][1]))
+        elif self.rng.random() < 0.5:
+            lines = (self.rng.choice(GREET[time_of_day(self.hour)]).format(b=b.name), self.rng.choice(REPLY))
+        else:
+            lines = (self.rng.choice(TOPIC[a.role]), self.rng.choice(REPLY))
+        cid = len(self.chats)
+        self.chats.append({
+            'id': cid, 'day': self.day, 'time': self.clock, 'rumor': rumor, 'lines': list(lines),
+            'a': a.name, 'a_role': a.role, 'a_last': a.memory[-1] if a.memory else None,
+            'b': b.name, 'b_role': b.role,
+        })
+        a.say(lines[0], 30, (cid, 0))
+        b.pending_line = (lines[1], (cid, 1))
         a.chat, b.chat = (b, 60), (a, 60)
         a.path, b.path = [], []
         a.social = max(0, a.social - 45)
@@ -589,12 +618,12 @@ class Village:
             p.water = max(0, p.water - 1)
         for a in self.agents:
             if a.bubble:
-                text, left = a.bubble
-                a.bubble = (text, left - 1) if left > 1 else None
+                text, left, ref = a.bubble
+                a.bubble = (text, left - 1, ref) if left > 1 else None
             if a.chat:
                 partner, left = a.chat
-                if left == 30 and getattr(a, 'pending_line', None):
-                    a.say(a.pending_line, 30)
+                if left == 30 and a.pending_line:
+                    a.say(a.pending_line[0], 30, a.pending_line[1])
                     a.pending_line = None
                 a.chat = (partner, left - 1) if left > 1 else None
                 a.moving = False
@@ -728,8 +757,10 @@ def glow_sprite(radius, color):
 
 
 class Renderer:
-    def __init__(self, village, seed):
-        self.v = village
+    '''Draws snapshots. Holds no reference to the live village, so it can run in worker processes.'''
+
+    def __init__(self, seed, dialogue=None):
+        self.dialogue = dialogue or {}
         self.bg, self.windows = draw_background(seed)
         self.font = load_font(10)
         self.hud_font = load_font(11)
@@ -798,7 +829,8 @@ class Renderer:
 
     def bubble(self, d, a, placed):
         '''Draws a speech bubble, lifted above any bubble it would overlap. Returns its box.'''
-        text = f'{a.name}: {a.bubble[0]}'
+        line, _, ref = a.bubble
+        text = f'{a.name}: {self.dialogue.get(ref, line)}'
         tw = d.textlength(text, font=self.font)
         x = min(max(4, a.x - tw / 2 - 4), W - tw - 12)
         y = max(24, a.y - 46)
@@ -825,8 +857,7 @@ class Renderer:
         spots.append((WELL[0] * TILE + 8, WELL[1] * TILE + 2, True, False))
         return spots
 
-    def frame(self, frame_no):
-        v = self.v
+    def frame(self, v, frame_no):
         img = self.bg.copy()
         d = ImageDraw.Draw(img)
         for p in v.plots:
@@ -858,11 +889,10 @@ class Renderer:
         for a in sorted((a for a in visible if a.bubble), key=lambda a: -a.y):
             placed.append(self.bubble(d, a, placed))
         clean = np.array(img)  # no HUD: feeds the ASCII and vertical renders
-        self.hud(d)
+        self.hud(d, v)
         return clean, np.asarray(img)
 
-    def hud(self, d):
-        v = self.v
+    def hud(self, d, v):
         s = v.stock
         knowers = sum(a.knows for a in v.agents)
         left = f'SEEDHOLLOW   Day {v.day}  {v.clock}'
@@ -881,38 +911,24 @@ class Renderer:
 
 # ---------------------------------------------------------------- output
 
-def ascii_frames_writer(path, fps, fontsize, background):
-    '''
-    Returns (convert, close) built on ascii.py's NumPy renderer, or None if unavailable.
-    convert(frame) writes the ASCII frame to `path` and returns it.
-    '''
-    sys.path.insert(0, HERE)
-    try:
+class AsciiStage:
+    '''Wraps ascii.py's NumPy renderer: frame in, ASCII frame out (cropped to even dimensions).'''
+
+    CHARS = ' .:-=+*#%@'
+
+    def __init__(self, fontsize, background):
+        sys.path.insert(0, HERE)
         import ascii as ascii_video
-    except ImportError as e:
-        print(f'[ascii] ascii.py not importable, skipping: {e}', file=sys.stderr)
-        return None
-    chars = np.array(list(' .:-=+*#%@'))
-    bitmaps = ascii_video.get_font_bitmaps(fontsize, max(1, fontsize // 10), False, background, chars,
-                                           os.path.join(HERE, 'cour.ttf'))
-    empty = np.array([], dtype=np.uint16)
-    state = {}
+        self.ascii = ascii_video
+        self.chars = np.array(list(self.CHARS))
+        self.background = background
+        self.bitmaps = ascii_video.get_font_bitmaps(fontsize, max(1, fontsize // 10), False, background,
+                                                    self.chars, os.path.join(HERE, 'cour.ttf'))
+        self.empty = np.array([], dtype=np.uint16)
 
-    def convert(frame):
-        out = ascii_video.draw_ascii(frame, chars, background, True, empty, bitmaps)
-        out = out[: out.shape[0] // 2 * 2, : out.shape[1] // 2 * 2]
-        if 'writer' not in state:
-            h, w = out.shape[:2]
-            state['writer'] = imageio_ffmpeg.write_frames(path, (w, h), fps=fps, quality=7, macro_block_size=2)
-            state['writer'].send(None)
-        out = np.ascontiguousarray(out)
-        state['writer'].send(out)
-        return out
-
-    def close():
-        if 'writer' in state:
-            state['writer'].close()
-    return convert, close
+    def __call__(self, frame):
+        out = self.ascii.draw_ascii(frame, self.chars, self.background, True, self.empty, self.bitmaps)
+        return np.ascontiguousarray(out[: out.shape[0] // 2 * 2, : out.shape[1] // 2 * 2])
 
 
 class Vertical:
@@ -925,8 +941,7 @@ class Vertical:
     CROP = (24, 0, W - 24, H)        # 720x432 of the map, scaled 1.5x to 1080x648
     PANEL_H = 648
 
-    def __init__(self, village, caption=None):
-        self.v = village
+    def __init__(self, caption=None):
         self.caption = caption       # None when treasuretavern will burn the caption in
         self.big = load_font(58)
         self.mid = load_font(34)
@@ -938,8 +953,7 @@ class Vertical:
         img = Image.fromarray(arr).crop(self.CROP) if arr.shape[1] >= W else Image.fromarray(arr)
         return img.resize((self.VW, self.PANEL_H), Image.NEAREST)
 
-    def compose(self, clean, ascii_frame):
-        v = self.v
+    def compose(self, v, clean, ascii_frame):
         img = Image.new('RGB', (self.VW, self.VH), (18, 22, 20))
         d = ImageDraw.Draw(img)
         if self.caption:
@@ -1010,7 +1024,103 @@ def make_short(tt_dir, src, out_dir, caption, seconds):
     return None
 
 
-def parse_args():
+# ---------------------------------------------------------------- pipeline
+
+# name: (file, ffmpeg quality, macro block size). Block sizes divide each output's dimensions exactly.
+OUTPUTS = {
+    'pixel': ('village.mp4', 8, 16),           # 768x432
+    'ascii': ('village_ascii.mp4', 7, 2),      # depends on glyph size; even dimensions
+    'vertical': ('village_vertical.mp4', 7, 8),  # 1080x1920
+}
+
+
+def simulate(seed, start_minute, frames, speed):
+    '''Runs the whole village first. Returns it and one snapshot per video frame.'''
+    village = Village(seed, start_minute)
+    scenes = []
+    for _ in range(frames):
+        for _ in range(speed):
+            village.tick()
+        scenes.append(snapshot(village))
+    return village, scenes
+
+
+def render_chunk(job):
+    '''
+    Renders a contiguous run of frames to its own segment files. Runs in a worker process.
+    Each segment starts with a keyframe and uses the same encoder settings, so segments
+    join losslessly afterwards.
+    '''
+    k, first, scenes, cfg, dialogue, seg_dir = job
+    renderer = Renderer(cfg['seed'], dialogue)
+    art = AsciiStage(cfg['ascii_font'], cfg['ascii_bg']) if 'ascii' in cfg['outputs'] else None
+    vertical = Vertical(cfg['caption']) if 'vertical' in cfg['outputs'] else None
+    writers = {}
+
+    def send(kind, arr):
+        if kind not in writers:
+            _, quality, block = OUTPUTS[kind]
+            h, w = arr.shape[:2]
+            writers[kind] = imageio_ffmpeg.write_frames(os.path.join(seg_dir, f'{kind}_{k:04d}.mp4'), (w, h),
+                                                        fps=cfg['fps'], quality=quality, macro_block_size=block,
+                                                        output_params=['-preset', cfg['preset']])
+            writers[kind].send(None)
+        writers[kind].send(np.ascontiguousarray(arr))
+
+    for i, scene in enumerate(scenes):
+        clean, framed = renderer.frame(scene, first + i)
+        send('pixel', framed)
+        if art:
+            ascii_frame = art(clean)
+            send('ascii', ascii_frame)
+            if vertical:
+                send('vertical', vertical.compose(scene, clean, ascii_frame))
+    for w in writers.values():
+        w.close()
+    return k, len(scenes)
+
+
+def join_segments(seg_dir, kind, n_chunks, out_path):
+    '''Concatenates segment files without re-encoding.'''
+    listing = os.path.join(seg_dir, f'{kind}.txt')
+    with open(listing, 'w') as f:
+        for k in range(n_chunks):
+            f.write(f"file '{os.path.abspath(os.path.join(seg_dir, f'{kind}_{k:04d}.mp4'))}'\n")
+    subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), '-v', 'error', '-y', '-f', 'concat', '-safe', '0',
+                    '-i', listing, '-c', 'copy', out_path], check=True)
+
+
+def render(scenes, cfg, dialogue, out_dir, jobs):
+    '''Renders every output, splitting the frames across `jobs` processes. Returns {kind: path}.'''
+    seg_dir = os.path.join(out_dir, '.segments')
+    shutil.rmtree(seg_dir, ignore_errors=True)
+    os.makedirs(seg_dir)
+    n_chunks = max(1, min(len(scenes), jobs * 2))
+    size = -(-len(scenes) // n_chunks)
+    work = [(k, k * size, scenes[k * size:(k + 1) * size], cfg, dialogue, seg_dir)
+            for k in range(n_chunks) if scenes[k * size:(k + 1) * size]]
+    done = 0
+    if jobs == 1:
+        results = map(render_chunk, work)
+    else:
+        pool = multiprocessing.get_context('spawn' if sys.platform == 'darwin' else 'fork').Pool(jobs)
+        results = pool.imap_unordered(render_chunk, work)
+    for _, n in results:
+        done += n
+        print(f'\r  rendered {done}/{len(scenes)} frames', end='', flush=True)
+    print()
+    if jobs != 1:
+        pool.close()
+        pool.join()
+    paths = {}
+    for kind in cfg['outputs']:
+        paths[kind] = os.path.join(out_dir, OUTPUTS[kind][0])
+        join_segments(seg_dir, kind, len(work), paths[kind])
+    shutil.rmtree(seg_dir)
+    return paths
+
+
+def parse_args(argv=None):
     p = argparse.ArgumentParser(description='Simulate an AI agent village and render it to video.')
     p.add_argument('-o', '--out', default='village_out', help='Output directory.')
     p.add_argument('-s', '--seconds', type=float, default=45, help='Video length in seconds.')
@@ -1019,6 +1129,9 @@ def parse_args():
     p.add_argument('--start', default='05:30', help='Clock time the video starts at (HH:MM).')
     p.add_argument('--seed', type=int, default=3,
                    help='Random seed. Same seed, same day. Seed 3 finds its rumor on day 1; many seeds take two days.')
+    p.add_argument('-j', '--jobs', type=int, default=os.cpu_count() or 1, help='Render processes. 1 renders in-process.')
+    p.add_argument('--preset', default='veryfast',
+                   help='x264 preset. Encoding is most of the CPU time; slower presets make smaller files.')
     p.add_argument('--no-ascii', action='store_true', help='Skip the ASCII render (also skips the vertical render).')
     p.add_argument('--no-vertical', action='store_true', help='Skip the 1080x1920 render.')
     p.add_argument('--ascii-font', type=int, default=10, help='ASCII glyph size in pixels.')
@@ -1026,73 +1139,73 @@ def parse_args():
     p.add_argument('--shorts', metavar='TREASURETAVERN_DIR',
                    help='Burn the caption into the vertical render with treasuretavern instead of in Python.')
     p.add_argument('--caption', default='A day in an AI village', help='Caption for the vertical render.')
-    p.add_argument('--llm', action='store_true', help='Let Claude write the dialogue (needs anthropic + API credentials).')
+    p.add_argument('--llm', action='store_true', help='Let Claude rewrite the dialogue (needs anthropic + API credentials).')
     p.add_argument('--model', default='claude-opus-5', help='Claude model for --llm.')
-    p.add_argument('--llm-max', type=int, default=30, help='Maximum Claude calls per run. Each call pauses the render.')
-    return p.parse_args()
+    p.add_argument('--llm-max', type=int, default=30, help='Maximum chats Claude rewrites. Rumor chats go first.')
+    return p.parse_args(argv)
+
+
+def run(args):
+    os.makedirs(args.out, exist_ok=True)
+    hh, mm = map(int, args.start.split(':'))
+    frames = int(args.seconds * args.fps)
+    timings = {}
+
+    t = time.perf_counter()
+    village, scenes = simulate(args.seed, hh * 60 + mm, frames, args.speed)
+    timings['simulate'] = time.perf_counter() - t
+
+    t = time.perf_counter()
+    writer = ClaudeWriter(args.model, args.llm_max) if args.llm else None
+    dialogue = writer.fill(village.chats) if writer else {}
+    timings['dialogue'] = time.perf_counter() - t
+
+    outputs = ['pixel']
+    if not args.no_ascii:
+        outputs.append('ascii')
+        if not args.no_vertical:
+            outputs.append('vertical')
+    cfg = {'seed': args.seed, 'fps': args.fps, 'outputs': outputs, 'ascii_font': args.ascii_font,
+           'ascii_bg': args.ascii_bg, 'caption': None if args.shorts else args.caption, 'preset': args.preset}
+    t = time.perf_counter()
+    paths = render(scenes, cfg, dialogue, args.out, max(1, args.jobs))
+    timings['render'] = time.perf_counter() - t
+
+    if args.shorts and 'vertical' in paths:
+        t = time.perf_counter()
+        short = make_short(args.shorts, paths['vertical'], args.out, args.caption, args.seconds)
+        timings['shorts'] = time.perf_counter() - t
+        if short:
+            paths['short'] = short
+
+    for chat in village.chats:
+        chat['lines'] = [dialogue.get((chat['id'], i), line) for i, line in enumerate(chat['lines'])]
+    log = {
+        'seed': args.seed,
+        'rumor': village.rumor[1] if village.rumor else None,
+        'rumor_known_by': [a.name for a in village.agents if a.knows],
+        'stock': village.stock,
+        'llm_calls': writer.calls if writer else 0,
+        'llm_lines_used': len(dialogue) // 2,
+        'timings_s': {k: round(v, 2) for k, v in timings.items()},
+        'events': village.events,
+        'chats': village.chats,
+        'memories': {a.name: a.memory for a in village.agents},
+    }
+    paths['log'] = os.path.join(args.out, 'village_log.json')
+    with open(paths['log'], 'w') as f:
+        json.dump(log, f, indent=2)
+    return village, paths, log
 
 
 def main():
     args = parse_args()
-    os.makedirs(args.out, exist_ok=True)
-    hh, mm = map(int, args.start.split(':'))
-    writer = ClaudeWriter(args.model, args.llm_max) if args.llm else None
-    village = Village(args.seed, hh * 60 + mm, writer)
-    renderer = Renderer(village, args.seed)
-
-    paths = {k: os.path.join(args.out, f) for k, f in
-             (('pixel', 'village.mp4'), ('ascii', 'village_ascii.mp4'), ('vertical', 'village_vertical.mp4'))}
-    pixel = imageio_ffmpeg.write_frames(paths['pixel'], (W, H), fps=args.fps, quality=8, macro_block_size=16)
-    pixel.send(None)
-    ascii_out = None if args.no_ascii else ascii_frames_writer(paths['ascii'], args.fps, args.ascii_font, args.ascii_bg)
-    vertical = vwriter = None
-    if ascii_out and not args.no_vertical:
-        vertical = Vertical(village, None if args.shorts else args.caption)
-        vwriter = imageio_ffmpeg.write_frames(paths['vertical'], (Vertical.VW, Vertical.VH), fps=args.fps,
-                                              quality=7, macro_block_size=8)
-        vwriter.send(None)
-
-    frames = int(args.seconds * args.fps)
-    for i in range(frames):
-        for _ in range(args.speed):
-            village.tick()
-        clean, framed = renderer.frame(i)
-        pixel.send(np.ascontiguousarray(framed))
-        if ascii_out:
-            art = ascii_out[0](clean)
-            if vwriter:
-                vwriter.send(np.ascontiguousarray(vertical.compose(clean, art)))
-        if i % args.fps == 0:
-            print(f'\rDay {village.day} {village.clock}  frame {i}/{frames}', end='', flush=True)
-    print()
-    pixel.close()
-    if ascii_out:
-        ascii_out[1]()
-    if vwriter:
-        vwriter.close()
-
-    with open(os.path.join(args.out, 'village_log.json'), 'w') as f:
-        json.dump({
-            'seed': args.seed,
-            'rumor': village.rumor[1] if village.rumor else None,
-            'rumor_known_by': [a.name for a in village.agents if a.knows],
-            'stock': village.stock,
-            'llm_calls': writer.calls if writer else 0,
-            'events': village.events,
-            'memories': {a.name: a.memory for a in village.agents},
-        }, f, indent=2)
-
-    print(f'pixel     {paths["pixel"]}')
-    if ascii_out:
-        print(f'ascii     {paths["ascii"]}')
-    if vwriter:
-        print(f'vertical  {paths["vertical"]}')
-        if args.shorts:
-            short = make_short(args.shorts, paths['vertical'], args.out, args.caption, args.seconds)
-            if short:
-                print(f'short     {short}')
-    print(f'log       {os.path.join(args.out, "village_log.json")}  ({len(village.events)} events, rumor: '
-          f'{village.rumor[1] if village.rumor else "none"}, known by {sum(a.knows for a in village.agents)}/8)')
+    village, paths, log = run(args)
+    for kind, path in paths.items():
+        print(f'{kind:<9} {path}')
+    print('timings  ' + '  '.join(f'{k} {v}s' for k, v in log['timings_s'].items()))
+    print(f'story    {len(village.events)} events, {len(village.chats)} chats, rumor: {log["rumor"] or "none"},'
+          f' known by {len(log["rumor_known_by"])}/{len(village.agents)}')
 
 
 if __name__ == '__main__':
