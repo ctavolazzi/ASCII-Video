@@ -76,7 +76,6 @@ VILLAGERS = [
     ('SEED-1', 'robot', 'dock', '#9fb3bf', None),
 ]
 
-RUMOR = 'SEED-1 grew a pumpkin as big as a cart'
 
 
 def tile_center(t):
@@ -130,16 +129,28 @@ def bfs(start, goal):
 
 # ---------------------------------------------------------------- farm plots
 
+RIPE = 1.0
+GIANT = 1.5   # a ripe crop that keeps getting watered instead of picked overgrows
+MAX_GROWTH = 1.6
+
+
 class Plot:
-    def __init__(self, tx, ty, growth, giant=False):
+    def __init__(self, tx, ty, growth):
         self.tx, self.ty = tx, ty
         self.growth = growth
         self.water = 0       # minutes of watering left
-        self.giant = giant
 
     @property
     def tile(self):
         return (self.tx, self.ty)
+
+    @property
+    def ripe(self):
+        return self.growth >= RIPE
+
+    @property
+    def giant(self):
+        return self.growth >= GIANT
 
 
 def make_plots(rng):
@@ -148,7 +159,6 @@ def make_plots(rng):
     for j in range(fh // 2):
         for i in range(fw // 2):
             plots.append(Plot(fx + i * 2, fy + j * 2, rng.uniform(0.0, 0.8)))
-    plots[7].growth, plots[7].giant = 0.93, True
     return plots
 
 
@@ -168,11 +178,20 @@ TOPIC = {
     'innkeeper': ['Stew is on the fire.', 'Tavern opens at dusk.', 'Rooms are full tonight.'],
     'fisher': ['The pond is generous today.', 'Caught one this long!', 'Fish bite before the rain.'],
     'bard': ['I have a new verse.', 'Every village needs a song.', 'Tell me something worth singing.'],
-    'robot': ['WATER LEVELS NOMINAL.', 'PLOT 7 GROWTH: EXCEPTIONAL.', 'BATTERY OK. SOIL OK. HELLO.'],
+    'robot': ['WATER LEVELS NOMINAL.', 'SOIL MOISTURE OPTIMAL.', 'BATTERY OK. SOIL OK. HELLO.'],
 }
 REPLY = ['Ha, is that so?', 'Tell me more.', 'Good to hear.', 'You always say that.', 'Mm, fair enough.']
 TELL = ['Did you hear? {r}!', 'Word is {r}.', 'Swear on my boots: {r}!']
-REACT = ['No! Truly?', 'I have to see that.', 'The robot? Our robot?', 'That is going in a song.']
+
+# Things remarkable enough to become the village rumor. Whichever happens first wins.
+RUMORS = {
+    'pumpkin': ('SEED-1 grew a pumpkin as big as a cart',
+                ['No! Truly?', 'The robot? Our robot?', 'I have to see that.', 'That is going in a song.']),
+    'carp': ('Finn pulled a golden carp from the pond',
+             ['Golden? Like coins?', 'Finn always exaggerates.', 'I have to see that.', 'That is going in a song.']),
+}
+GOLDEN_CARP_CHANCE = 0.03
+HARVEST_MINUTES = 15
 
 
 def time_of_day(hour):
@@ -185,24 +204,53 @@ def time_of_day(hour):
     return 'night'
 
 
-class ClaudeWriter:
-    '''Optional: asks Claude for a two-line exchange. Falls back to templates on any failure.'''
+def parse_exchange(text, a_name, b_name):
+    '''Pulls "A: ..." and "B: ..." lines out of a reply. Returns (line_a, line_b) or None.'''
+    found = {}
+    for raw in text.splitlines():
+        line = raw.replace('*', '').strip()  # tolerate **Name:** markdown
+        for name in (a_name, b_name):
+            if name not in found and line.lower().startswith(name.lower() + ':'):
+                found[name] = line[len(name) + 1:].strip().strip('"')[:60]
+    if a_name in found and b_name in found and found[a_name] and found[b_name]:
+        return found[a_name], found[b_name]
+    return None
 
-    def __init__(self, model, max_calls):
+
+class ClaudeWriter:
+    '''
+    Optional: asks Claude for a two-line exchange between villagers.
+
+    Returns None whenever it cannot help (package missing, no credentials, API error,
+    refusal, unparseable reply) and the sim falls back to its template lines. Missing
+    credentials disable it for the rest of the run instead of failing on every chat.
+    Anything else is a bug in this file and is allowed to raise.
+    '''
+
+    def __init__(self, model, max_calls, client=None):
         self.model, self.max_calls, self.calls = model, max_calls, 0
-        self.client = None
-        try:
-            import anthropic
+        self.client = client
+        self.failures = 0
+        self.anthropic = None
+        if client is None:
+            try:
+                import anthropic
+            except ImportError:
+                print('[llm] disabled: pip install anthropic', file=sys.stderr)
+                return
             self.anthropic = anthropic
             self.client = anthropic.Anthropic()
-        except Exception as e:  # package missing or no credentials
-            print(f'[llm] disabled: {e}', file=sys.stderr)
 
-    def exchange(self, a, b, clock, tells_rumor):
+    def _errors(self):
+        if self.anthropic is None:
+            return (ConnectionError,)
+        return (self.anthropic.APIStatusError, self.anthropic.APIConnectionError)
+
+    def exchange(self, a, b, clock, rumor=None):
         if not self.client or self.calls >= self.max_calls:
             return None
         self.calls += 1
-        news = f' {a.name} is excited to tell {b.name} this rumor: "{RUMOR}".' if tells_rumor else ''
+        news = f' {a.name} is excited to tell {b.name} this rumor: "{rumor}".' if rumor else ''
         prompt = (
             f'Village of Seedhollow, {clock}. {a.name} the {a.role} meets {b.name} the {b.role}.'
             f' {a.name} last did: {a.memory[-1] if a.memory else "nothing yet"}.{news}'
@@ -218,14 +266,22 @@ class ClaudeWriter:
                 fallbacks='default',
                 messages=[{'role': 'user', 'content': prompt}],
             )
-        except Exception as e:  # API error, old SDK, network: keep the sim running on templates
-            print(f'[llm] call failed, using templates: {e}', file=sys.stderr)
+        except TypeError as e:
+            # The SDK raises TypeError at request time when it finds no credentials.
+            # Any other TypeError (a bad argument, an SDK too old for `fallbacks`) is a real bug.
+            if 'authentication' not in str(e):
+                raise
+            print('[llm] disabled: no Claude API credentials found', file=sys.stderr)
+            self.client = None
+            return None
+        except self._errors() as e:
+            self.failures += 1
+            print(f'[llm] call failed, using template lines: {e}', file=sys.stderr)
             return None
         if resp.stop_reason == 'refusal':
             return None
         text = ''.join(blk.text for blk in resp.content if blk.type == 'text')
-        lines = [ln.split(':', 1)[1].strip() for ln in text.splitlines() if ':' in ln]
-        return (lines[0][:60], lines[1][:60]) if len(lines) >= 2 else None
+        return parse_exchange(text, a.name, b.name)
 
 
 # ---------------------------------------------------------------- agents
@@ -245,6 +301,7 @@ class Agent:
         self.energy = rng.uniform(70, 90)
         self.social = rng.uniform(20, 50)
         self.battery = 100.0
+        self.harvest = 0
         self.wake = rng.randint(5 * 60 + 35, 6 * 60 + 40)
         self.knows = False
         self.memory = []
@@ -285,7 +342,8 @@ class Agent:
 class Village:
     def __init__(self, seed, start_minute, writer=None):
         self.rng = random.Random(seed)
-        self.minute = start_minute
+        self.minute = start_minute   # minutes since midnight of day 1
+        self.rumor = None            # (key, text) of the first remarkable event
         self.plots = make_plots(self.rng)
         self.agents = [Agent(*v, rng=self.rng) for v in VILLAGERS]
         self.by_name = {a.name: a for a in self.agents}
@@ -302,11 +360,15 @@ class Village:
         return (self.minute // 60) % 24
 
     @property
+    def day(self):
+        return self.minute // 1440 + 1
+
+    @property
     def clock(self):
         return f'{self.hour:02d}:{self.minute % 60:02d}'
 
     def log(self, text, who=None):
-        self.events.append({'time': self.clock, 'text': text})
+        self.events.append({'day': self.day, 'time': self.clock, 'text': text})
         if who:
             who.memory.append(text)
 
@@ -343,8 +405,10 @@ class Village:
         a.action = 'work'
         a.timer = self.rng.randint(30, 70)
         if a.role == 'farmer':
-            ripe = [p for p in self.plots if p.growth >= 1]
-            a.target_plot = ripe[0] if ripe else self.rng.choice(self.plots)
+            ripe = [p for p in self.plots if p.ripe]
+            near = lambda p: abs(p.tx - a.tile[0]) + abs(p.ty - a.tile[1])  # noqa: E731
+            a.target_plot = min(ripe, key=near) if ripe else self.rng.choice(self.plots)
+            a.harvest = 0
             a.go(a.target_plot.tile)
         elif a.role == 'fisher':
             a.go(FISH_SPOT)
@@ -363,7 +427,7 @@ class Village:
             a.go(self.door('dock'))
             return
         a.action = 'water'
-        dry = sorted(self.plots, key=lambda p: (p.water > 0, p.growth >= 1, self.rng.random()))
+        dry = sorted(self.plots, key=lambda p: (p.water > 0, self.rng.random()))
         a.target_plot = dry[0]
         a.go(a.target_plot.tile)
         a.timer = 12
@@ -424,37 +488,53 @@ class Village:
         m, r = self.minute, a.role
         if r == 'farmer' and a.target_plot:
             p = a.target_plot
-            if p.growth >= 1:
-                self.stock['crops'] += 3 if p.giant else 1
+            if p.ripe and a.harvest < HARVEST_MINUTES:
+                a.harvest += 1  # picking takes a while
+            elif p.ripe:
+                a.harvest = 0
                 if p.giant:
-                    a.knows = True
+                    self.stock['crops'] += 3
                     a.say('By the stars, look at it!', 40)
-                    self.log(f'Ada harvested a giant pumpkin. {RUMOR}!', a)
+                    self.log(f'{a.name} harvested a giant pumpkin.', a)
+                    self.discover('pumpkin', a)
                 else:
+                    self.stock['crops'] += 1
                     a.say('Another one ripe.')
-                    self.log('Ada harvested a crop.', a)
-                p.growth, p.giant = 0.0, False
+                    self.log(f'{a.name} harvested a crop.', a)
+                p.growth = 0.0
                 a.timer = 0
             else:
-                p.growth = min(1, p.growth + 0.002)
-                if any(q.growth >= 1 for q in self.plots):
+                p.growth = min(RIPE, p.growth + 0.002)
+                if any(q.ripe for q in self.plots):
                     a.timer = 0  # something is ripe: go pick it instead
         elif r == 'baker' and m % 30 == 0:
             if self.stock['crops'] > 0:
                 self.stock['crops'] -= 1
                 self.stock['bread'] += 2
-                self.log('Bram baked two loaves.', a)
+                self.log(f'{a.name} baked two loaves.', a)
             elif m % 60 == 0:
                 self.stock['bread'] += 1
         elif r == 'smith' and m % 90 == 0:
             self.stock['tools'] += 1
-            self.log('Cora forged a tool.', a)
+            self.log(f'{a.name} forged a tool.', a)
         elif r == 'scribe' and m % 45 == 0:
             self.stock['pages'] += 1
         elif r == 'fisher' and m % 20 == 0 and self.rng.random() < 0.45:
             self.stock['fish'] += 1
-            a.say('Got one!')
-            self.log('Finn caught a fish.', a)
+            if self.rng.random() < GOLDEN_CARP_CHANCE:
+                a.say('It is... GOLDEN?!', 40)
+                self.log(f'{a.name} caught a golden carp.', a)
+                self.discover('carp', a)
+            else:
+                a.say('Got one!')
+                self.log(f'{a.name} caught a fish.', a)
+
+    def discover(self, key, witness):
+        '''The first remarkable event becomes the rumor; its witness is the first to know.'''
+        if self.rumor is None:
+            self.rumor = (key, RUMORS[key][0])
+            witness.knows = True
+            self.log(f'New rumor: {self.rumor[1]}.', witness)
 
     # -- two agents close together may talk, and gossip spreads
     def try_chats(self):
@@ -476,10 +556,11 @@ class Village:
         if b.knows and not a.knows:
             a, b = b, a
         tells = a.knows and not b.knows
-        lines = self.writer.exchange(a, b, self.clock, tells) if self.writer else None
+        rumor = self.rumor[1] if tells else None
+        lines = self.writer.exchange(a, b, self.clock, rumor) if self.writer else None
         if not lines:
             if tells:
-                lines = (self.rng.choice(TELL).format(r=RUMOR), self.rng.choice(REACT))
+                lines = (self.rng.choice(TELL).format(r=rumor), self.rng.choice(RUMORS[self.rumor[0]][1]))
             elif self.rng.random() < 0.5:
                 lines = (self.rng.choice(GREET[time_of_day(self.hour)]).format(b=b.name), self.rng.choice(REPLY))
             else:
@@ -501,9 +582,10 @@ class Village:
     def tick(self):
         self.minute += 1
         for p in self.plots:
-            rate = 0.0022 if p.water > 0 else 0.0008
-            if 0 < p.growth < 1:
-                p.growth = min(1, p.growth + rate)
+            if 0 < p.growth < RIPE:
+                p.growth = min(RIPE, p.growth + (0.0022 if p.water > 0 else 0.0008))
+            elif p.ripe and p.water > 0:
+                p.growth = min(MAX_GROWTH, p.growth + 0.0022)  # overgrowth, only while watered
             p.water = max(0, p.water - 1)
         for a in self.agents:
             if a.bubble:
@@ -673,10 +755,11 @@ class Renderer:
                 elif g < 1:
                     d.ellipse([cx - 3, cy - 5, cx + 3, cy + 1], fill='#4a9a3a')
                     d.point([cx, cy - 2], fill='#e0a030')
-                elif not p.giant:
+                elif g < RIPE + 0.05 or (i, j) != (1, 1):
                     d.ellipse([cx - 3, cy - 3, cx + 3, cy + 2], fill='#e8892a', outline='#9a5518')
-        if p.giant and g >= 0.7:
-            s = 6 + int(9 * min(1, (g - 0.7) / 0.3))
+        if g >= RIPE + 0.05:
+            # the centre pumpkin swells as the plot overgrows
+            s = 4 + int(11 * min(1, (g - RIPE) / (GIANT - RIPE)))
             d.ellipse([X + 16 - s, Y + 18 - s, X + 16 + s, Y + 16 + s // 2], fill='#f08a24', outline='#8a4a10', width=2)
             d.line([X + 16, Y + 18 - s, X + 17, Y + 13 - s], fill='#3f7a2a', width=2)
 
@@ -774,14 +857,15 @@ class Renderer:
         placed = []
         for a in sorted((a for a in visible if a.bubble), key=lambda a: -a.y):
             placed.append(self.bubble(d, a, placed))
+        clean = np.array(img)  # no HUD: feeds the ASCII and vertical renders
         self.hud(d)
-        return np.asarray(img)
+        return clean, np.asarray(img)
 
     def hud(self, d):
         v = self.v
         s = v.stock
         knowers = sum(a.knows for a in v.agents)
-        left = f'SEEDHOLLOW   Day 1  {v.clock}'
+        left = f'SEEDHOLLOW   Day {v.day}  {v.clock}'
         right = f'bread {s["bread"]}  crops {s["crops"]}  fish {s["fish"]}  tools {s["tools"]}   rumor {knowers}/{len(v.agents)}'
         d.rectangle([0, 0, W, 17], fill=(20, 24, 22))
         d.text((6, 2), left, fill='#f2e6c9', font=self.hud_font)
@@ -798,7 +882,10 @@ class Renderer:
 # ---------------------------------------------------------------- output
 
 def ascii_frames_writer(path, fps, fontsize, background):
-    '''Returns (convert, writer) using ascii.py's NumPy renderer, or None if unavailable.'''
+    '''
+    Returns (convert, close) built on ascii.py's NumPy renderer, or None if unavailable.
+    convert(frame) writes the ASCII frame to `path` and returns it.
+    '''
     sys.path.insert(0, HERE)
     try:
         import ascii as ascii_video
@@ -818,12 +905,76 @@ def ascii_frames_writer(path, fps, fontsize, background):
             h, w = out.shape[:2]
             state['writer'] = imageio_ffmpeg.write_frames(path, (w, h), fps=fps, quality=7, macro_block_size=2)
             state['writer'].send(None)
-        state['writer'].send(np.ascontiguousarray(out))
+        out = np.ascontiguousarray(out)
+        state['writer'].send(out)
+        return out
 
     def close():
         if 'writer' in state:
             state['writer'].close()
     return convert, close
+
+
+class Vertical:
+    '''
+    Lays out a 1080x1920 frame for Shorts: a caption band, the pixel village,
+    the same moment through ascii.py, then clock, rumor meter and recent events.
+    '''
+    VW, VH = 1080, 1920
+    BAND = 200                       # caption band; treasuretavern draws here with --shorts
+    CROP = (24, 0, W - 24, H)        # 720x432 of the map, scaled 1.5x to 1080x648
+    PANEL_H = 648
+
+    def __init__(self, village, caption=None):
+        self.v = village
+        self.caption = caption       # None when treasuretavern will burn the caption in
+        self.big = load_font(58)
+        self.mid = load_font(34)
+        self.small = load_font(27)
+        self.tag = load_font(22)
+        self.chip = load_font(24)
+
+    def panel(self, arr):
+        img = Image.fromarray(arr).crop(self.CROP) if arr.shape[1] >= W else Image.fromarray(arr)
+        return img.resize((self.VW, self.PANEL_H), Image.NEAREST)
+
+    def compose(self, clean, ascii_frame):
+        v = self.v
+        img = Image.new('RGB', (self.VW, self.VH), (18, 22, 20))
+        d = ImageDraw.Draw(img)
+        if self.caption:
+            tw = d.textlength(self.caption, font=self.big)
+            d.text(((self.VW - tw) / 2, 30), self.caption, fill='#f2e6c9', font=self.big)
+        sub = 'Seedhollow, an AI agent village'
+        tw = d.textlength(sub, font=self.small)
+        d.text(((self.VW - tw) / 2, 140), sub, fill='#9fb09a', font=self.small)
+
+        y = self.BAND
+        for arr, label in ((clean, 'PIXEL'), (ascii_frame, 'ASCII  via ascii.py')):
+            img.paste(self.panel(arr), (0, y))
+            lw = d.textlength(label, font=self.tag)
+            d.rectangle([16, y + 14, 16 + lw + 20, y + 48], fill=(18, 22, 20))
+            d.text((26, y + 17), label, fill='#cfd8cf', font=self.tag)
+            y += self.PANEL_H
+
+        # info panel
+        top = y + 24
+        d.text((40, top), f'Day {v.day}   {v.clock}', fill='#f2e6c9', font=self.big)
+        knowers = sum(a.knows for a in v.agents)
+        rumor = v.rumor[1] if v.rumor else 'No rumor yet. Something will happen.'
+        d.text((40, top + 78), f'RUMOR {knowers}/{len(v.agents)}', fill='#ffd84a' if knowers else '#8a948a', font=self.mid)
+        d.text((260, top + 82), rumor[:44], fill='#e6dcc0' if v.rumor else '#8a948a', font=self.small)
+        # one chip per villager, ringed in gold once they have heard the rumor
+        for i, a in enumerate(v.agents):
+            cx, cy = 40 + (i % 4) * 255, top + 140 + (i // 4) * 58
+            ring = '#ffd84a' if a.knows else '#3a443c'
+            d.ellipse([cx, cy, cx + 38, cy + 38], fill=a.color, outline=ring, width=4)
+            d.text((cx + 50, cy + 5), a.name, fill='#f2e6c9' if a.knows else '#8a948a', font=self.chip)
+        ey = top + 262
+        for e in v.events[-3:]:
+            d.text((40, ey), f'{e["time"]}  {e["text"]}'[:62], fill='#cfd8cf', font=self.tag)
+            ey += 34
+        return np.asarray(img)
 
 
 def clean_caption(text):
@@ -863,18 +1014,21 @@ def parse_args():
     p = argparse.ArgumentParser(description='Simulate an AI agent village and render it to video.')
     p.add_argument('-o', '--out', default='village_out', help='Output directory.')
     p.add_argument('-s', '--seconds', type=float, default=45, help='Video length in seconds.')
-    p.add_argument('--fps', type=int, default=24, help='Frames per second. One frame is one village minute.')
+    p.add_argument('--fps', type=int, default=24, help='Frames per second.')
+    p.add_argument('--speed', type=int, default=1, help='Village minutes per frame. At 24 fps, --speed 2 fits two days into 60 s.')
     p.add_argument('--start', default='05:30', help='Clock time the video starts at (HH:MM).')
-    p.add_argument('--seed', type=int, default=7, help='Random seed. Same seed, same day.')
-    p.add_argument('--no-ascii', action='store_true', help='Skip the ASCII render.')
+    p.add_argument('--seed', type=int, default=3,
+                   help='Random seed. Same seed, same day. Seed 3 finds its rumor on day 1; many seeds take two days.')
+    p.add_argument('--no-ascii', action='store_true', help='Skip the ASCII render (also skips the vertical render).')
+    p.add_argument('--no-vertical', action='store_true', help='Skip the 1080x1920 render.')
     p.add_argument('--ascii-font', type=int, default=10, help='ASCII glyph size in pixels.')
     p.add_argument('--ascii-bg', type=int, default=0, choices=[0, 255], help='ASCII background, 0 black or 255 white.')
-    p.add_argument('--shorts', metavar='TREASURETAVERN_DIR', help='Also cut a 9:16 Short with treasuretavern.')
-    p.add_argument('--shorts-source', choices=['pixel', 'ascii'], default='pixel', help='Which render the Short is cut from.')
-    p.add_argument('--caption', default='A day in an AI village', help='Caption burned into the Short.')
+    p.add_argument('--shorts', metavar='TREASURETAVERN_DIR',
+                   help='Burn the caption into the vertical render with treasuretavern instead of in Python.')
+    p.add_argument('--caption', default='A day in an AI village', help='Caption for the vertical render.')
     p.add_argument('--llm', action='store_true', help='Let Claude write the dialogue (needs anthropic + API credentials).')
     p.add_argument('--model', default='claude-opus-5', help='Claude model for --llm.')
-    p.add_argument('--llm-max', type=int, default=30, help='Maximum Claude calls per run.')
+    p.add_argument('--llm-max', type=int, default=30, help='Maximum Claude calls per run. Each call pauses the render.')
     return p.parse_args()
 
 
@@ -886,44 +1040,59 @@ def main():
     village = Village(args.seed, hh * 60 + mm, writer)
     renderer = Renderer(village, args.seed)
 
-    pixel_path = os.path.join(args.out, 'village.mp4')
-    ascii_path = os.path.join(args.out, 'village_ascii.mp4')
-    pixel = imageio_ffmpeg.write_frames(pixel_path, (W, H), fps=args.fps, quality=8, macro_block_size=16)
+    paths = {k: os.path.join(args.out, f) for k, f in
+             (('pixel', 'village.mp4'), ('ascii', 'village_ascii.mp4'), ('vertical', 'village_vertical.mp4'))}
+    pixel = imageio_ffmpeg.write_frames(paths['pixel'], (W, H), fps=args.fps, quality=8, macro_block_size=16)
     pixel.send(None)
-    ascii_out = None if args.no_ascii else ascii_frames_writer(ascii_path, args.fps, args.ascii_font, args.ascii_bg)
+    ascii_out = None if args.no_ascii else ascii_frames_writer(paths['ascii'], args.fps, args.ascii_font, args.ascii_bg)
+    vertical = vwriter = None
+    if ascii_out and not args.no_vertical:
+        vertical = Vertical(village, None if args.shorts else args.caption)
+        vwriter = imageio_ffmpeg.write_frames(paths['vertical'], (Vertical.VW, Vertical.VH), fps=args.fps,
+                                              quality=7, macro_block_size=8)
+        vwriter.send(None)
 
     frames = int(args.seconds * args.fps)
     for i in range(frames):
-        village.tick()
-        frame = renderer.frame(i)
-        pixel.send(np.ascontiguousarray(frame))
+        for _ in range(args.speed):
+            village.tick()
+        clean, framed = renderer.frame(i)
+        pixel.send(np.ascontiguousarray(framed))
         if ascii_out:
-            ascii_out[0](frame)
+            art = ascii_out[0](clean)
+            if vwriter:
+                vwriter.send(np.ascontiguousarray(vertical.compose(clean, art)))
         if i % args.fps == 0:
-            print(f'\r{village.clock}  frame {i}/{frames}', end='', flush=True)
+            print(f'\rDay {village.day} {village.clock}  frame {i}/{frames}', end='', flush=True)
     print()
     pixel.close()
     if ascii_out:
         ascii_out[1]()
+    if vwriter:
+        vwriter.close()
 
     with open(os.path.join(args.out, 'village_log.json'), 'w') as f:
         json.dump({
-            'events': village.events,
-            'stock': village.stock,
+            'seed': args.seed,
+            'rumor': village.rumor[1] if village.rumor else None,
             'rumor_known_by': [a.name for a in village.agents if a.knows],
+            'stock': village.stock,
+            'llm_calls': writer.calls if writer else 0,
+            'events': village.events,
             'memories': {a.name: a.memory for a in village.agents},
         }, f, indent=2)
 
-    print(f'pixel  {pixel_path}')
+    print(f'pixel     {paths["pixel"]}')
     if ascii_out:
-        print(f'ascii  {ascii_path}')
-    if args.shorts:
-        src = ascii_path if args.shorts_source == 'ascii' and ascii_out else pixel_path
-        short = make_short(args.shorts, src, args.out, args.caption, args.seconds)
-        if short:
-            print(f'short  {short}')
-    print(f'log    {os.path.join(args.out, "village_log.json")}  ({len(village.events)} events,'
-          f' rumor reached {sum(a.knows for a in village.agents)}/{len(village.agents)})')
+        print(f'ascii     {paths["ascii"]}')
+    if vwriter:
+        print(f'vertical  {paths["vertical"]}')
+        if args.shorts:
+            short = make_short(args.shorts, paths['vertical'], args.out, args.caption, args.seconds)
+            if short:
+                print(f'short     {short}')
+    print(f'log       {os.path.join(args.out, "village_log.json")}  ({len(village.events)} events, rumor: '
+          f'{village.rumor[1] if village.rumor else "none"}, known by {sum(a.knows for a in village.agents)}/8)')
 
 
 if __name__ == '__main__':

@@ -64,13 +64,26 @@ pip install numpy pillow tqdm imageio imageio-ffmpeg
 
 # Seedhollow: an AI agent village
 
-`village.py` is a whole agent village in one file. Seven villagers and SEED-1, a farm robot, live through a day: they plan around hunger, energy and company, walk the map, farm, bake, fish, forge, chat, and pass a rumor from one to the next. Each frame is one village minute, rendered in pixel art and then through this repo's ASCII renderer.
+`village.py` is a whole agent village in one file. Seven villagers and SEED-1, a farm robot, live through the day. They plan around hunger, energy and company, walk the map, farm, bake, fish, forge, chat, and pass along a rumor. One frame is one village minute (`--speed` changes that).
+
+By default the agents are rule-based: a utility function picks each action and dialogue comes from templates. With `--llm`, Claude writes the conversations. Nothing in the story is scripted. The rumor is whatever remarkable thing happens first:
+- a pumpkin the robot kept watering after it ripened grows giant, or
+- Finn lands a golden carp.
+
+Across seeds 1 to 20, 18 produce a rumor within two days. Seed 3, the default, finds its rumor on day 1.
 
 ```
-python village.py                                  # 45 s day: village.mp4 + village_ascii.mp4
-python village.py --seconds 20 --no-ascii          # quick pixel-only render
-python village.py --shorts ../treasuretavern       # also cut a 1080x1920 Short with treasuretavern
+python village.py                                  # 45 s day: village.mp4, village_ascii.mp4, village_vertical.mp4
+python village.py --seconds 60 --speed 2 --seed 9  # two days in one minute
+python village.py --shorts ../treasuretavern       # treasuretavern burns the caption into the vertical render
 python village.py --llm                            # Claude writes the dialogue (anthropic package + API credentials)
+python -m unittest test_village                    # tests
 ```
 
-Output goes to `village_out/`, including `village_log.json` with every event and each villager's memory. The same `--seed` always produces the same day.
+Outputs go to `village_out/`:
+- `village.mp4`: the pixel render, 768x432.
+- `village_ascii.mp4`: the same frames through `ascii.py`.
+- `village_vertical.mp4`: a 1080x1920 layout for Shorts, with the pixel view, the ASCII view and a rumor tracker.
+- `village_log.json`: every event and each villager's memory.
+
+The same `--seed` always produces the same day. A 50 s render with every output takes about 50 s on 4 CPUs; most of that is encoding the vertical video.
